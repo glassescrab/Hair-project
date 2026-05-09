@@ -104,24 +104,24 @@ MODES = {
     "1": HairMode(
         key="1",
         name="short",
-        asset_name="short.png",
-        video_name="short.mp4",
+        asset_name="wig-short.png",
+        video_name="story1.mp4",
         width_scale=1.55,
         y_offset_ratio=-0.52,
     ),
     "2": HairMode(
         key="2",
         name="long",
-        asset_name="long_black.png",
-        video_name="long.mp4",
+        asset_name="wig-long-black.png",
+        video_name="story2.mp4",
         width_scale=1.95,
         y_offset_ratio=-0.40,
     ),
     "3": HairMode(
         key="3",
         name="pink_long",
-        asset_name="long_pink.png",
-        video_name="pink.mp4",
+        asset_name="wig-long-pink.png",
+        video_name="story3.mp4",
         width_scale=1.95,
         y_offset_ratio=-0.40,
     ),
@@ -227,7 +227,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--nfc-port",
-        default="COM7",
+        default="COM6",
         help="Serial port for the PN532/PCR532 NFC reader.",
     )
     parser.add_argument(
@@ -1239,6 +1239,10 @@ def main() -> int:
                             key = show_frame(display_frame)
                             if key == 27:
                                 break
+                            elif key in (ord("1"), ord("2"), ord("3")):
+                                command_queue.put(chr(key))
+                            elif key == ord("x"):
+                                command_queue.put("xd")
                             continue
                     display_frame, found_face = process_active_frame(
                         frame,

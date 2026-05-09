@@ -9,7 +9,7 @@ import websockets
 # =========================
 # CONFIG
 # =========================
-SERIAL_PORT = "COM7"      # 改成你的 PCR532 端口
+SERIAL_PORT = "COM6"      # 改成你的 PCR532 端口
 BAUD_RATE = 115200        # 不行就改成 9600 再试
 WS_HOST = "127.0.0.1"
 WS_PORT = 8765
