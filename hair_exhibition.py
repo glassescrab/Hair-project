@@ -8,6 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 PROJECT_DIR = Path(__file__).resolve().parent
 os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_DIR / ".cache" / "matplotlib"))
@@ -20,6 +21,7 @@ import numpy as np
 
 WINDOW_NAME = "Human Hair Exhibition"
 ASSET_DIR = PROJECT_DIR / "assets" / "hair"
+VIDEO_DIR = PROJECT_DIR / "assets" / "videos"
 DEBUG_DIR = PROJECT_DIR / "debug_frames"
 LAYERED_GENERATED_DIR = ASSET_DIR / "layered_generated"
 LAYERED_DOWNLOADED_DIR = ASSET_DIR / "layered_downloaded"
@@ -45,6 +47,7 @@ class HairMode:
     key: str
     name: str
     asset_name: str
+    video_name: str
     width_scale: float
     y_offset_ratio: float
     x_offset_ratio: float = 0.0
@@ -60,25 +63,65 @@ class FaceGeometry:
     angle_degrees: float
 
 
+class VideoPlayback:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.capture = cv2.VideoCapture(str(path))
+        self.fps = float(self.capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        self.frame_count = int(self.capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.started_at: float | None = None
+        self.last_frame_index = -1
+        self.last_fitted_frame: np.ndarray | None = None
+
+    def is_opened(self) -> bool:
+        return self.capture.isOpened()
+
+    def read(self, shape: tuple[int, int]) -> np.ndarray | None:
+        if self.started_at is None:
+            self.started_at = time.monotonic()
+        if self.fps > 0 and self.frame_count > 0:
+            elapsed = max(0.0, time.monotonic() - self.started_at)
+            target_index = int(elapsed * self.fps)
+            if target_index >= self.frame_count:
+                return None
+            if target_index <= self.last_frame_index and self.last_fitted_frame is not None:
+                return self.last_fitted_frame.copy()
+            if target_index > self.last_frame_index + 1:
+                self.capture.set(cv2.CAP_PROP_POS_FRAMES, target_index)
+
+        ok, frame = self.capture.read()
+        if not ok or frame is None:
+            return None
+        self.last_frame_index = int(self.capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+        self.last_fitted_frame = fit_frame_to_shape(frame, shape)
+        return self.last_fitted_frame.copy()
+
+    def release(self) -> None:
+        self.capture.release()
+
+
 MODES = {
     "1": HairMode(
         key="1",
         name="short",
         asset_name="short.png",
+        video_name="short.mp4",
         width_scale=1.55,
         y_offset_ratio=-0.52,
     ),
     "2": HairMode(
         key="2",
         name="long",
-        asset_name="long.png",
+        asset_name="long_black.png",
+        video_name="long.mp4",
         width_scale=1.95,
         y_offset_ratio=-0.40,
     ),
     "3": HairMode(
         key="3",
         name="pink_long",
-        asset_name="pink_long.png",
+        asset_name="long_pink.png",
+        video_name="pink.mp4",
         width_scale=1.95,
         y_offset_ratio=-0.40,
     ),
@@ -91,14 +134,23 @@ LAYERED_SPECS = {
         HairLayerSpec("front.png", width_scale=1.30, y_offset_ratio=-0.54, restore_face_after=True),
     ),
     "long": (
-        HairLayerSpec("back.png", width_scale=1.82, y_offset_ratio=-0.56, restore_face_after=True),
-        HairLayerSpec("front.png", width_scale=1.76, y_offset_ratio=-0.58),
+        HairLayerSpec("back.png", width_scale=1.58, y_offset_ratio=-0.50, restore_face_after=True),
+        HairLayerSpec("front.png", width_scale=1.48, y_offset_ratio=-0.51),
     ),
     "pink_long": (
-        HairLayerSpec("back.png", width_scale=1.82, y_offset_ratio=-0.56, restore_face_after=True),
-        HairLayerSpec("front.png", width_scale=1.76, y_offset_ratio=-0.58),
+        HairLayerSpec("back.png", width_scale=1.58, y_offset_ratio=-0.50, restore_face_after=True),
+        HairLayerSpec("front.png", width_scale=1.48, y_offset_ratio=-0.51),
     ),
 }
+
+
+REPLACE_HAIR_STYLES = {"long", "pink_long"}
+UID_TO_MODE = {
+    "65B40FA7": "1",
+    "656759A7": "2",
+    "756DA5A7": "3",
+}
+PN532_ACK_FRAME = b"\x00\x00\xFF\x00\xFF\x00"
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,7 +168,7 @@ def parse_args() -> argparse.Namespace:
         "--duration",
         type=float,
         default=6.0,
-        help="Seconds to stay active after a trigger.",
+        help="Seconds to stay active for non-video effects such as the birthday message.",
     )
     parser.add_argument(
         "--debug-save",
@@ -168,6 +220,34 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="Maximum seconds to wait in --calibrate-long mode.",
     )
+    parser.add_argument(
+        "--no-nfc",
+        action="store_true",
+        help="Disable NFC polling and use terminal triggers only.",
+    )
+    parser.add_argument(
+        "--nfc-port",
+        default="COM7",
+        help="Serial port for the PN532/PCR532 NFC reader.",
+    )
+    parser.add_argument(
+        "--nfc-baud",
+        type=int,
+        default=115200,
+        help="Baud rate for the PN532/PCR532 NFC reader.",
+    )
+    parser.add_argument(
+        "--nfc-poll-interval",
+        type=float,
+        default=0.25,
+        help="Seconds between NFC polling attempts.",
+    )
+    parser.add_argument(
+        "--nfc-debounce",
+        type=float,
+        default=1.2,
+        help="Seconds before the same NFC card can retrigger while still present.",
+    )
     return parser.parse_args()
 
 
@@ -196,6 +276,178 @@ def start_input_thread(command_queue: queue.Queue[str]) -> threading.Thread:
     return thread
 
 
+def hexstr(data: bytes) -> str:
+    return data.hex(" ").upper()
+
+
+def build_pn532_frame(cmd: int, data: bytes = b"") -> bytes:
+    payload = bytes([0xD4, cmd]) + data
+    length = len(payload)
+    lcs = (-length) & 0xFF
+    dcs = (-sum(payload)) & 0xFF
+    return bytes([0x00, 0x00, 0xFF, length, lcs]) + payload + bytes([dcs, 0x00])
+
+
+def read_pn532_frame(ser: Any, timeout: float = 1.0) -> bytes | str | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        b = ser.read(1)
+        if not b or b != b"\x00":
+            continue
+        b2 = ser.read(1)
+        if not b2 or b2 != b"\x00":
+            continue
+        b3 = ser.read(1)
+        if not b3 or b3 != b"\xFF":
+            continue
+
+        len_byte = ser.read(1)
+        lcs_byte = ser.read(1)
+        if not len_byte or not lcs_byte:
+            continue
+
+        length = len_byte[0]
+        lcs = lcs_byte[0]
+        if length == 0x00 and lcs == 0xFF:
+            post = ser.read(1)
+            if post == b"\x00":
+                return "ACK"
+            continue
+        if ((length + lcs) & 0xFF) != 0:
+            continue
+
+        payload = ser.read(length)
+        dcs = ser.read(1)
+        post = ser.read(1)
+        if len(payload) != length or len(dcs) != 1 or post != b"\x00":
+            continue
+        if dcs[0] != ((-sum(payload)) & 0xFF):
+            print("Bad PN532 DCS. Payload:", hexstr(payload))
+            continue
+        return payload
+    return None
+
+
+def pn532_wakeup(ser: Any) -> None:
+    ser.write(b"\x55\x55" + b"\x00" * 14)
+    ser.flush()
+    time.sleep(0.1)
+    ser.reset_input_buffer()
+
+
+def send_pn532_command(ser: Any, cmd: int, data: bytes = b"", timeout: float = 1.0) -> bytes:
+    ser.write(build_pn532_frame(cmd, data))
+    ser.flush()
+
+    got_ack = False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        remaining = max(0.01, deadline - time.time())
+        response = read_pn532_frame(ser, timeout=remaining)
+        if response is None:
+            break
+        if response == "ACK":
+            got_ack = True
+            continue
+        return response
+
+    if not got_ack:
+        raise TimeoutError(f"No ACK for PN532 command 0x{cmd:02X}")
+    raise TimeoutError(f"No response payload for PN532 command 0x{cmd:02X}")
+
+
+def get_pn532_firmware_version(ser: Any) -> bytes | None:
+    response = send_pn532_command(ser, 0x02, b"", timeout=1.0)
+    if len(response) >= 6 and response[0] == 0xD5 and response[1] == 0x03:
+        return response
+    return None
+
+
+def set_pn532_sam_normal_mode(ser: Any) -> None:
+    response = send_pn532_command(ser, 0x14, b"\x01", timeout=1.0)
+    if not (len(response) >= 2 and response[0] == 0xD5 and response[1] == 0x15):
+        raise RuntimeError(f"SAMConfiguration failed: {hexstr(response)}")
+
+
+def read_type_a_uid(ser: Any) -> str | None:
+    response = send_pn532_command(ser, 0x4A, b"\x01\x00", timeout=0.8)
+    if not (len(response) >= 3 and response[0] == 0xD5 and response[1] == 0x4B):
+        print("Unexpected InListPassiveTarget response:", hexstr(response))
+        return None
+    if response[2] == 0:
+        return None
+    if len(response) < 8:
+        print("Short target response:", hexstr(response))
+        return None
+
+    uid_length = response[7]
+    start = 8
+    end = start + uid_length
+    if len(response) < end:
+        print("UID length mismatch:", hexstr(response))
+        return None
+    return response[start:end].hex().upper()
+
+
+def start_nfc_thread(
+    command_queue: queue.Queue[str],
+    port: str,
+    baud: int,
+    poll_interval: float,
+    debounce_seconds: float,
+) -> threading.Thread:
+    def poll_cards() -> None:
+        try:
+            import serial
+        except ImportError:
+            print("NFC disabled: pyserial is not installed. Run pip install -r requirements.txt.")
+            return
+
+        try:
+            print(f"Opening NFC reader on {port} at {baud} baud...")
+            ser = serial.Serial(port, baud, timeout=0.1)
+        except Exception as exc:
+            print(f"NFC disabled: could not open {port}: {exc}")
+            return
+
+        try:
+            pn532_wakeup(ser)
+            firmware = get_pn532_firmware_version(ser)
+            if firmware:
+                print("NFC firmware response:", hexstr(firmware))
+            else:
+                print("NFC firmware response not recognized.")
+            set_pn532_sam_normal_mode(ser)
+            print("NFC reader ready.")
+
+            last_uid = None
+            last_trigger_at = 0.0
+            while True:
+                try:
+                    uid = read_type_a_uid(ser)
+                    now = time.monotonic()
+                    if uid:
+                        mode_key = UID_TO_MODE.get(uid)
+                        print(f"NFC UID detected: {uid} | mode={mode_key}")
+                        if mode_key and (uid != last_uid or now - last_trigger_at > debounce_seconds):
+                            command_queue.put(mode_key)
+                            last_uid = uid
+                            last_trigger_at = now
+                    else:
+                        last_uid = None
+                except TimeoutError:
+                    pass
+                except Exception as exc:
+                    print("NFC poll error:", exc)
+                time.sleep(max(0.05, poll_interval))
+        finally:
+            ser.close()
+
+    thread = threading.Thread(target=poll_cards, daemon=True)
+    thread.start()
+    return thread
+
+
 def create_placeholder_assets() -> None:
     ASSET_DIR.mkdir(parents=True, exist_ok=True)
     for mode in MODES.values():
@@ -205,18 +457,6 @@ def create_placeholder_assets() -> None:
         image = make_placeholder_hair(mode.name)
         cv2.imwrite(str(asset_path), image)
         print(f"Generated placeholder asset: {asset_path}")
-
-    layered_root = LAYERED_GENERATED_DIR
-    for mode in MODES.values():
-        mode_dir = layered_root / mode.name
-        mode_dir.mkdir(parents=True, exist_ok=True)
-        generated_layers = make_generated_hair_layers(mode.name)
-        for file_name, image in generated_layers.items():
-            layer_path = mode_dir / file_name
-            if layer_path.exists():
-                continue
-            cv2.imwrite(str(layer_path), image)
-            print(f"Generated layered asset: {layer_path}")
 
 
 def make_placeholder_hair(style: str) -> np.ndarray:
@@ -334,6 +574,24 @@ def prepare_hair_asset(image: np.ndarray, style: str) -> np.ndarray:
     return feather_hair_alpha(blacken_hair_asset(image))
 
 
+def trim_hair_asset(image: np.ndarray, alpha_threshold: int = 8, padding: int = 24) -> np.ndarray:
+    if image.shape[2] != 4:
+        return image
+
+    alpha = image[:, :, 3]
+    ys, xs = np.where(alpha > alpha_threshold)
+    if len(xs) == 0:
+        return image
+
+    x_min = max(0, int(xs.min()) - padding)
+    y_min = max(0, int(ys.min()) - padding)
+    x_max = min(image.shape[1], int(xs.max()) + padding + 1)
+    y_max = min(image.shape[0], int(ys.max()) + padding + 1)
+    trimmed = image[y_min:y_max, x_min:x_max].copy()
+    trimmed[:, :, 3][trimmed[:, :, 3] <= alpha_threshold] = 0
+    return trimmed
+
+
 def feather_hair_alpha(image: np.ndarray) -> np.ndarray:
     image = image.copy()
     if image.shape[2] != 4:
@@ -351,6 +609,15 @@ def load_hair_assets(
     assets = {}
     layered_root = LAYERED_DOWNLOADED_DIR if hair_set == "downloaded" else LAYERED_GENERATED_DIR
     for mode in MODES.values():
+        path = ASSET_DIR / mode.asset_name
+        image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if image is not None:
+            if image.shape[2] == 3:
+                alpha = np.full(image.shape[:2] + (1,), 255, dtype=np.uint8)
+                image = np.concatenate([image, alpha], axis=2)
+            assets[mode.key] = feather_hair_alpha(trim_hair_asset(image))
+            continue
+
         if use_layered:
             layer_assets = {}
             mode_dir = layered_root / mode.name
@@ -367,14 +634,7 @@ def load_hair_assets(
                 assets[mode.key] = layer_assets
                 continue
 
-        path = ASSET_DIR / mode.asset_name
-        image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-        if image is None:
-            raise RuntimeError(f"Could not load hair asset: {path}")
-        if image.shape[2] == 3:
-            alpha = np.full(image.shape[:2] + (1,), 255, dtype=np.uint8)
-            image = np.concatenate([image, alpha], axis=2)
-        assets[mode.key] = prepare_hair_asset(image, mode.name)
+        raise RuntimeError(f"Could not load hair asset: {path}")
     return assets
 
 
@@ -412,6 +672,25 @@ def read_camera_frame(camera: cv2.VideoCapture, fallback_shape: tuple[int, int])
     return frame
 
 
+def fit_frame_to_shape(frame: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    target_height, target_width = shape
+    source_height, source_width = frame.shape[:2]
+    if source_height <= 0 or source_width <= 0:
+        return np.zeros((target_height, target_width, 3), dtype=np.uint8)
+
+    scale = max(target_width / source_width, target_height / source_height)
+    resized_width = max(1, int(source_width * scale))
+    resized_height = max(1, int(source_height * scale))
+    resized = cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+
+    x0 = max(0, (resized_width - target_width) // 2)
+    y0 = max(0, (resized_height - target_height) // 2)
+    cropped = resized[y0 : y0 + target_height, x0 : x0 + target_width]
+    if cropped.shape[:2] != (target_height, target_width):
+        cropped = cv2.resize(cropped, (target_width, target_height), interpolation=cv2.INTER_AREA)
+    return cropped
+
+
 def blur_background(
     frame: np.ndarray,
     segmentation: mp.solutions.selfie_segmentation.SelfieSegmentation,
@@ -426,6 +705,25 @@ def blur_background(
     mask_3 = np.dstack([mask] * 3)
     blurred = cv2.GaussianBlur(frame, (55, 55), 0)
     return np.where(mask_3 > 0.48, frame, blurred).astype(np.uint8)
+
+
+def replace_background_with_video(
+    frame: np.ndarray,
+    video_frame: np.ndarray,
+    segmentation: mp.solutions.selfie_segmentation.SelfieSegmentation,
+) -> np.ndarray:
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    result = segmentation.process(rgb)
+    mask = result.segmentation_mask
+    if mask is None:
+        return video_frame.copy()
+
+    mask = cv2.GaussianBlur(mask, (31, 31), 0)
+    alpha = np.clip((mask - 0.28) / 0.52, 0.0, 1.0)
+    alpha_3 = np.dstack([alpha] * 3).astype(np.float32)
+    camera_float = frame.astype(np.float32)
+    video_float = video_frame.astype(np.float32)
+    return ((camera_float * alpha_3) + (video_float * (1.0 - alpha_3))).astype(np.uint8)
 
 
 def find_face_geometry(
@@ -566,6 +864,38 @@ def restore_face_oval(
     target[:] = blended.astype(np.uint8)
 
 
+def restore_visible_face(
+    target: np.ndarray,
+    source: np.ndarray,
+    face_geometry: FaceGeometry,
+) -> None:
+    face_width = max(1.0, face_geometry.width)
+    face_height = max(1.0, face_geometry.height)
+    center = (
+        int(face_geometry.center_x),
+        int(face_geometry.top_y + face_height * 0.58),
+    )
+    axes = (int(face_width * 0.46), int(face_height * 0.48))
+    mask = np.zeros(target.shape[:2], dtype=np.uint8)
+    cv2.ellipse(
+        mask,
+        center,
+        axes,
+        face_geometry.angle_degrees,
+        0,
+        360,
+        255,
+        -1,
+        cv2.LINE_AA,
+    )
+    crown_cutoff = int(np.clip(face_geometry.top_y + face_height * 0.25, 0, target.shape[0] - 1))
+    mask[:crown_cutoff, :] = 0
+    mask = cv2.GaussianBlur(mask, (23, 23), 0).astype(np.float32) / 255.0
+    mask_3 = np.dstack([mask] * 3)
+    blended = source.astype(np.float32) * mask_3 + target.astype(np.float32) * (1.0 - mask_3)
+    target[:] = blended.astype(np.uint8)
+
+
 def composite_rgba(background: np.ndarray, overlay: np.ndarray, x: int, y: int) -> None:
     bg_height, bg_width = background.shape[:2]
     ov_height, ov_width = overlay.shape[:2]
@@ -693,9 +1023,13 @@ def process_active_frame(
     hair_assets: dict[str, dict[str, np.ndarray] | np.ndarray],
     face_mesh: mp.solutions.face_mesh.FaceMesh,
     segmentation: mp.solutions.selfie_segmentation.SelfieSegmentation,
+    background_frame: np.ndarray | None = None,
 ) -> tuple[np.ndarray, bool]:
     face_geometry = find_face_geometry(frame, face_mesh)
-    processed = blur_background(frame, segmentation)
+    if background_frame is None:
+        processed = blur_background(frame, segmentation)
+    else:
+        processed = replace_background_with_video(frame, background_frame, segmentation)
     if face_geometry is None:
         return processed, False
 
@@ -707,7 +1041,10 @@ def process_active_frame(
             if layer.restore_face_after:
                 restore_face_oval(processed, base_before_hair, face_geometry.box)
     else:
+        base_before_hair = processed.copy()
         overlay_hair(processed, mode_assets, active_mode, face_geometry)
+        if active_mode.name in REPLACE_HAIR_STYLES:
+            restore_visible_face(processed, base_before_hair, face_geometry)
     return processed, True
 
 
@@ -814,6 +1151,14 @@ def main() -> int:
 
     command_queue: queue.Queue[str] = queue.Queue()
     start_input_thread(command_queue)
+    if not args.no_nfc:
+        start_nfc_thread(
+            command_queue,
+            args.nfc_port,
+            args.nfc_baud,
+            args.nfc_poll_interval,
+            args.nfc_debounce,
+        )
 
     camera = cv2.VideoCapture(args.camera, camera_backend(args.backend))
     if camera.isOpened():
@@ -824,6 +1169,7 @@ def main() -> int:
 
     active_effect: HairMode | str | None = None
     active_until = 0.0
+    active_video: VideoPlayback | None = None
     debug_saved_for_session = False
     debug_face_detected_at: float | None = None
 
@@ -838,10 +1184,23 @@ def main() -> int:
                     return 0
                 if command in MODES:
                     active_effect = MODES[command]
-                    active_until = time.monotonic() + args.duration
+                    active_until = 0.0
+                    if active_video is not None:
+                        active_video.release()
+                    video_path = VIDEO_DIR / active_effect.video_name
+                    active_video = VideoPlayback(video_path)
+                    if active_video.is_opened():
+                        print(f"Triggered mode {command}: {active_effect.name} with video {video_path.name}")
+                    else:
+                        active_video.release()
+                        active_video = None
+                        active_until = time.monotonic() + args.duration
+                        print(
+                            f"Triggered mode {command}: {active_effect.name}. "
+                            f"Warning: could not open {video_path}; falling back to {args.duration:g} seconds."
+                        )
                     debug_saved_for_session = False
                     debug_face_detected_at = None
-                    print(f"Triggered mode {command}: {active_effect.name}")
                     if face_mesh is None:
                         mp_face_mesh = mp.solutions.face_mesh
                         face_mesh = mp_face_mesh.FaceMesh(
@@ -851,6 +1210,9 @@ def main() -> int:
                             min_tracking_confidence=0.35,
                         )
                 elif command == BIRTHDAY_COMMAND:
+                    if active_video is not None:
+                        active_video.release()
+                        active_video = None
                     active_effect = BIRTHDAY_COMMAND
                     active_until = time.monotonic() + args.duration
                     debug_saved_for_session = False
@@ -860,14 +1222,31 @@ def main() -> int:
             now = time.monotonic()
             frame = read_camera_frame(camera, fallback_shape)
             fallback_shape = frame.shape[:2]
-            if active_effect is not None and now < active_until:
+            has_video_mode = isinstance(active_effect, HairMode) and active_video is not None
+            has_timed_mode = active_effect is not None and active_video is None and now < active_until
+            if has_video_mode or has_timed_mode:
                 if isinstance(active_effect, HairMode):
+                    background_frame = None
+                    if active_video is not None:
+                        background_frame = active_video.read(frame.shape[:2])
+                        if background_frame is None:
+                            print("Video complete. Returning to idle.")
+                            active_video.release()
+                            active_video = None
+                            active_effect = None
+                            debug_face_detected_at = None
+                            display_frame = process_idle_frame(frame, segmentation)
+                            key = show_frame(display_frame)
+                            if key == 27:
+                                break
+                            continue
                     display_frame, found_face = process_active_frame(
                         frame,
                         active_effect,
                         hair_assets,
                         face_mesh,
                         segmentation,
+                        background_frame,
                     )
                     if args.debug_save and found_face and debug_face_detected_at is None:
                         debug_face_detected_at = now
@@ -885,6 +1264,9 @@ def main() -> int:
             else:
                 if active_effect is not None:
                     print("Returning to idle.")
+                if active_video is not None:
+                    active_video.release()
+                    active_video = None
                 active_effect = None
                 debug_face_detected_at = None
                 display_frame = process_idle_frame(frame, segmentation)
@@ -893,6 +1275,8 @@ def main() -> int:
             if key == 27:
                 break
     finally:
+        if active_video is not None:
+            active_video.release()
         if face_mesh is not None:
             face_mesh.close()
         if segmentation is not None:
