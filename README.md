@@ -3,17 +3,49 @@
 Fullscreen Python prototype for an exhibition interaction about human hair.
 Idle mode shows the live camera with a blurred background and the instruction:
 "Please put the dolls onto the reader to see her story". Triggered hair styles
-play their matching background video, then return to the idle camera instruction
-view when the video is complete.
+play their matching background video with audio. NFC interaction stays in the
+selected mode while the doll remains on the reader and returns to the idle
+camera instruction view when the doll is removed.
 
 ## Setup
 
-Install Python 3.10 or 3.11 first, then run these commands from this folder:
+Install Python 3.10 or 3.11 first. Do not use Python 3.14 for this project:
+`mediapipe==0.10.14` needs a Python 3.11-compatible wheel.
+
+On Windows, this installs the tested runtime:
+
+```powershell
+winget install --id Python.Python.3.11 --source winget -e --accept-package-agreements --accept-source-agreements
+```
+
+Install FFmpeg too. The app uses `ffplay` from FFmpeg to play the audio track
+from the MP4 background videos while OpenCV renders the video frames:
+
+```powershell
+winget install --id Gyan.FFmpeg --source winget -e --accept-package-agreements --accept-source-agreements
+```
+
+Open a new PowerShell after installing Python or FFmpeg so PATH changes are
+loaded. Then run these commands from this folder:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Check that the environment is ready:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip check
+ffplay -version
+```
+
+If `ffplay` is installed but not on `PATH`, pass the full path when starting the
+app:
+
+```powershell
+.\.venv\Scripts\python.exe hair_exhibition.py --audio-player C:\path\to\ffplay.exe
 ```
 
 ## Run
@@ -32,8 +64,11 @@ Terminal controls:
 
 NFC triggers:
 
-- NFC polling is enabled by default on `COM7` at `115200` baud.
+- NFC polling is enabled by default on `COM6` at `115200` baud.
 - The current card mapping is `65B40FA7 = 1`, `656759A7 = 2`, and `756DA5A7 = 3`.
+- The current mode follows reader state: card present selects its mapped mode,
+  and card removed returns to idle. The same card staying on the reader does not
+  retrigger the video.
 - Terminal controls stay available while NFC polling is running.
 
 Window controls:
@@ -50,6 +85,8 @@ Useful development options:
 .\.venv\Scripts\python.exe hair_exhibition.py --debug-save --debug-delay 1.5
 .\.venv\Scripts\python.exe hair_exhibition.py --no-nfc
 .\.venv\Scripts\python.exe hair_exhibition.py --nfc-port COM8
+.\.venv\Scripts\python.exe hair_exhibition.py --audio-player C:\ffmpeg\bin\ffplay.exe
+.\.venv\Scripts\python.exe hair_exhibition.py --no-video-audio
 .\.venv\Scripts\python.exe hair_exhibition.py --hair-set generated
 .\.venv\Scripts\python.exe hair_exhibition.py --flat-hair
 .\.venv\Scripts\python.exe hair_exhibition.py --windowed --calibrate-long
@@ -69,8 +106,13 @@ Hair assets:
 Video assets:
 
 - Active backgrounds are read from `assets/videos/`.
-- Current video mapping is `1 = short.mp4`, `2 = long.mp4`, and `3 = pink.mp4`.
-- Hair modes stay active until the selected video reaches the end. If a video is missing or cannot be opened, the app falls back to `--duration`.
+- Current video mapping is `1 = story1.mp4`, `2 = story2.mp4`, and `3 = story3.mp4`.
+- MP4 audio is played through `ffplay`, so FFmpeg must be installed and
+  `ffplay` must be on `PATH`, or pass its full path with `--audio-player`.
+- NFC hair modes stay active until the card is removed. When the video reaches
+  the end while the card is still present, it loops without an NFC retrigger. If
+  a video is missing or cannot be opened, NFC mode keeps the hair effect active
+  until removal; terminal-triggered modes fall back to `--duration`.
 
 ## Replacing Assets
 
@@ -88,9 +130,9 @@ and blends the alpha edge at runtime.
 
 To replace a background video, overwrite the matching MP4 in `assets/videos/`:
 
-- `short.mp4` for mode `1`
-- `long.mp4` for mode `2`
-- `pink.mp4` for mode `3`
+- `story1.mp4` for mode `1`
+- `story2.mp4` for mode `2`
+- `story3.mp4` for mode `3`
 
 Use landscape MP4 files when possible. The app resizes each video to fill the
 screen and center-crops it to the camera frame, so a `16:9` video such as

@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import os
 import queue
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -64,14 +66,19 @@ class FaceGeometry:
 
 
 class VideoPlayback:
-    def __init__(self, path: Path) -> None:
+    _missing_audio_players: set[str] = set()
+
+    def __init__(self, path: Path, play_audio: bool = True, audio_player: str = "ffplay") -> None:
         self.path = path
+        self.play_audio = play_audio
+        self.audio_player = audio_player
         self.capture = cv2.VideoCapture(str(path))
         self.fps = float(self.capture.get(cv2.CAP_PROP_FPS) or 0.0)
         self.frame_count = int(self.capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         self.started_at: float | None = None
         self.last_frame_index = -1
         self.last_fitted_frame: np.ndarray | None = None
+        self.audio_process: subprocess.Popen[bytes] | None = None
 
     def is_opened(self) -> bool:
         return self.capture.isOpened()
@@ -79,6 +86,7 @@ class VideoPlayback:
     def read(self, shape: tuple[int, int]) -> np.ndarray | None:
         if self.started_at is None:
             self.started_at = time.monotonic()
+            self.start_audio()
         if self.fps > 0 and self.frame_count > 0:
             elapsed = max(0.0, time.monotonic() - self.started_at)
             target_index = int(elapsed * self.fps)
@@ -96,7 +104,67 @@ class VideoPlayback:
         self.last_fitted_frame = fit_frame_to_shape(frame, shape)
         return self.last_fitted_frame.copy()
 
+    def restart(self) -> None:
+        self.stop_audio()
+        self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self.started_at = None
+        self.last_frame_index = -1
+        self.last_fitted_frame = None
+
+    def start_audio(self) -> None:
+        if not self.play_audio or self.audio_process is not None:
+            return
+        player_path = shutil.which(self.audio_player)
+        if player_path is None:
+            if self.audio_player not in self._missing_audio_players:
+                print(
+                    f"Video audio disabled: '{self.audio_player}' was not found. "
+                    "Install FFmpeg/ffplay or pass --audio-player with the ffplay path."
+                )
+                self._missing_audio_players.add(self.audio_player)
+            return
+
+        startupinfo = None
+        creationflags = 0
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            creationflags = subprocess.CREATE_NO_WINDOW
+
+        try:
+            self.audio_process = subprocess.Popen(
+                [
+                    player_path,
+                    "-nodisp",
+                    "-autoexit",
+                    "-loglevel",
+                    "quiet",
+                    str(self.path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            print(f"Video audio disabled: could not start {self.audio_player}: {exc}")
+            self.audio_process = None
+
+    def stop_audio(self) -> None:
+        if self.audio_process is None:
+            return
+        if self.audio_process.poll() is None:
+            self.audio_process.terminate()
+            try:
+                self.audio_process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self.audio_process.kill()
+                self.audio_process.wait(timeout=1.0)
+        self.audio_process = None
+
     def release(self) -> None:
+        self.stop_audio()
         self.capture.release()
 
 
@@ -246,7 +314,17 @@ def parse_args() -> argparse.Namespace:
         "--nfc-debounce",
         type=float,
         default=1.2,
-        help="Seconds before the same NFC card can retrigger while still present.",
+        help="Seconds a removed NFC card must stay absent before returning to idle.",
+    )
+    parser.add_argument(
+        "--no-video-audio",
+        action="store_true",
+        help="Disable MP4 audio playback.",
+    )
+    parser.add_argument(
+        "--audio-player",
+        default="ffplay",
+        help="ffplay executable used for MP4 audio playback. Install FFmpeg or pass the full ffplay path.",
     )
     return parser.parse_args()
 
@@ -420,25 +498,33 @@ def start_nfc_thread(
             set_pn532_sam_normal_mode(ser)
             print("NFC reader ready.")
 
-            last_uid = None
-            last_trigger_at = 0.0
+            reported_mode: str | None = None
+            absent_since: float | None = None
             while True:
+                uid = None
                 try:
                     uid = read_type_a_uid(ser)
-                    now = time.monotonic()
-                    if uid:
-                        mode_key = UID_TO_MODE.get(uid)
-                        print(f"NFC UID detected: {uid} | mode={mode_key}")
-                        if mode_key and (uid != last_uid or now - last_trigger_at > debounce_seconds):
-                            command_queue.put(mode_key)
-                            last_uid = uid
-                            last_trigger_at = now
-                    else:
-                        last_uid = None
                 except TimeoutError:
                     pass
                 except Exception as exc:
                     print("NFC poll error:", exc)
+
+                now = time.monotonic()
+                if uid:
+                    absent_since = None
+                    mode_key = UID_TO_MODE.get(uid)
+                    if mode_key != reported_mode:
+                        print(f"NFC UID detected: {uid} | mode={mode_key}")
+                        command_queue.put(f"nfc:{mode_key}" if mode_key else "nfc:none")
+                        reported_mode = mode_key
+                elif reported_mode is not None:
+                    if absent_since is None:
+                        absent_since = now
+                    elif now - absent_since >= max(0.0, debounce_seconds):
+                        print("NFC card removed. Returning to idle.")
+                        command_queue.put("nfc:none")
+                        reported_mode = None
+                        absent_since = None
                 time.sleep(max(0.05, poll_interval))
         finally:
             ser.close()
@@ -1170,6 +1256,7 @@ def main() -> int:
     active_effect: HairMode | str | None = None
     active_until = 0.0
     active_video: VideoPlayback | None = None
+    active_from_nfc = False
     debug_saved_for_session = False
     debug_face_detected_at: float | None = None
 
@@ -1180,24 +1267,51 @@ def main() -> int:
         while True:
             while not command_queue.empty():
                 command = command_queue.get_nowait()
+                from_nfc = False
+                if command.startswith("nfc:"):
+                    from_nfc = True
+                    command = command.removeprefix("nfc:")
+                    if command == "none":
+                        if active_video is not None:
+                            active_video.release()
+                            active_video = None
+                        if active_effect is not None:
+                            print("NFC idle. Returning to idle.")
+                        active_effect = None
+                        active_from_nfc = False
+                        active_until = 0.0
+                        debug_face_detected_at = None
+                        continue
                 if command in {"q", "quit", "exit"}:
                     return 0
                 if command in MODES:
+                    if from_nfc and active_from_nfc and isinstance(active_effect, HairMode) and active_effect.key == command:
+                        continue
                     active_effect = MODES[command]
+                    active_from_nfc = from_nfc
                     active_until = 0.0
                     if active_video is not None:
                         active_video.release()
                     video_path = VIDEO_DIR / active_effect.video_name
-                    active_video = VideoPlayback(video_path)
+                    active_video = VideoPlayback(
+                        video_path,
+                        play_audio=not args.no_video_audio,
+                        audio_player=args.audio_player,
+                    )
                     if active_video.is_opened():
                         print(f"Triggered mode {command}: {active_effect.name} with video {video_path.name}")
                     else:
                         active_video.release()
                         active_video = None
-                        active_until = time.monotonic() + args.duration
+                        active_until = float("inf") if from_nfc else time.monotonic() + args.duration
                         print(
                             f"Triggered mode {command}: {active_effect.name}. "
-                            f"Warning: could not open {video_path}; falling back to {args.duration:g} seconds."
+                            f"Warning: could not open {video_path}; "
+                            + (
+                                "staying active until NFC removal."
+                                if from_nfc
+                                else f"falling back to {args.duration:g} seconds."
+                            )
                         )
                     debug_saved_for_session = False
                     debug_face_detected_at = None
@@ -1214,6 +1328,7 @@ def main() -> int:
                         active_video.release()
                         active_video = None
                     active_effect = BIRTHDAY_COMMAND
+                    active_from_nfc = False
                     active_until = time.monotonic() + args.duration
                     debug_saved_for_session = False
                     debug_face_detected_at = None
@@ -1230,20 +1345,40 @@ def main() -> int:
                     if active_video is not None:
                         background_frame = active_video.read(frame.shape[:2])
                         if background_frame is None:
-                            print("Video complete. Returning to idle.")
-                            active_video.release()
-                            active_video = None
-                            active_effect = None
-                            debug_face_detected_at = None
-                            display_frame = process_idle_frame(frame, segmentation)
-                            key = show_frame(display_frame)
-                            if key == 27:
-                                break
-                            elif key in (ord("1"), ord("2"), ord("3")):
-                                command_queue.put(chr(key))
-                            elif key == ord("x"):
-                                command_queue.put("xd")
-                            continue
+                            if active_from_nfc:
+                                active_video.restart()
+                                background_frame = active_video.read(frame.shape[:2])
+                                if background_frame is None:
+                                    print("Video complete, but could not restart. Returning to idle.")
+                                    active_video.release()
+                                    active_video = None
+                                    active_effect = None
+                                    active_from_nfc = False
+                                    debug_face_detected_at = None
+                                    display_frame = process_idle_frame(frame, segmentation)
+                                    key = show_frame(display_frame)
+                                    if key == 27:
+                                        break
+                                    elif key in (ord("1"), ord("2"), ord("3")):
+                                        command_queue.put(chr(key))
+                                    elif key == ord("x"):
+                                        command_queue.put("xd")
+                                    continue
+                            else:
+                                print("Video complete. Returning to idle.")
+                                active_video.release()
+                                active_video = None
+                                active_effect = None
+                                debug_face_detected_at = None
+                                display_frame = process_idle_frame(frame, segmentation)
+                                key = show_frame(display_frame)
+                                if key == 27:
+                                    break
+                                elif key in (ord("1"), ord("2"), ord("3")):
+                                    command_queue.put(chr(key))
+                                elif key == ord("x"):
+                                    command_queue.put("xd")
+                                continue
                     display_frame, found_face = process_active_frame(
                         frame,
                         active_effect,
@@ -1272,6 +1407,7 @@ def main() -> int:
                     active_video.release()
                     active_video = None
                 active_effect = None
+                active_from_nfc = False
                 debug_face_detected_at = None
                 display_frame = process_idle_frame(frame, segmentation)
 
