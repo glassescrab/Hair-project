@@ -89,6 +89,13 @@ Window controls:
 
 - `Esc`: quit
 
+Display resolution:
+
+- Fullscreen mode renders to the primary monitor resolution so the idle prompt,
+  icon, and story chips stay sharp instead of being stretched from the camera
+  frame. If monitor detection is wrong, override it with `--display-width` and
+  `--display-height`.
+
 Useful development options:
 
 ```powershell
@@ -101,6 +108,7 @@ Useful development options:
 .\.venv\Scripts\python.exe hair_exhibition.py --nfc-port COM8
 .\.venv\Scripts\python.exe hair_exhibition.py --audio-player C:\ffmpeg\bin\ffplay.exe
 .\.venv\Scripts\python.exe hair_exhibition.py --no-video-audio
+.\.venv\Scripts\python.exe hair_exhibition.py --display-width 1920 --display-height 1080
 .\.venv\Scripts\python.exe hair_exhibition.py --hair-set generated
 .\.venv\Scripts\python.exe hair_exhibition.py --flat-hair
 .\.venv\Scripts\python.exe hair_exhibition.py --windowed --calibrate-long

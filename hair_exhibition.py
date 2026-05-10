@@ -19,6 +19,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_DIR / ".cache" / "matplotlib")
 import cv2
 import mediapipe as mp
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 
 WINDOW_NAME = "Human Hair Exhibition"
@@ -30,9 +31,18 @@ LAYERED_DOWNLOADED_DIR = ASSET_DIR / "layered_downloaded"
 BIRTHDAY_COMMAND = "xd"
 BIRTHDAY_MESSAGE = "happy birthday, xd"
 IDLE_MESSAGE_LINES = (
-    "Please put the dolls onto the reader",
-    "to see her story",
+    "PICK UP A STORY.",
+    "PLACE IT ON THE STAND.",
 )
+IDLE_STORY_CARDS = (
+    ("1", "Measured", (170, 170, 170)),
+    ("2", "Recognized", (102, 102, 102)),
+    ("3", "Consumed", (185, 167, 244)),
+)
+IDLE_BASE_CACHE: dict[tuple[int, int], np.ndarray] = {}
+IDLE_UI_OVERLAY_CACHE: dict[tuple[int, int], np.ndarray] = {}
+FONT_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+FONT_CACHE: dict[tuple[str, int], ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
 
 
 @dataclass(frozen=True)
@@ -326,6 +336,18 @@ def parse_args() -> argparse.Namespace:
         default="ffplay",
         help="ffplay executable used for MP4 audio playback. Install FFmpeg or pass the full ffplay path.",
     )
+    parser.add_argument(
+        "--display-width",
+        type=int,
+        default=0,
+        help="Fullscreen output width. Defaults to the primary monitor width.",
+    )
+    parser.add_argument(
+        "--display-height",
+        type=int,
+        default=0,
+        help="Fullscreen output height. Defaults to the primary monitor height.",
+    )
     return parser.parse_args()
 
 
@@ -335,6 +357,30 @@ def camera_backend(name: str) -> int:
         "dshow": cv2.CAP_DSHOW,
         "msmf": cv2.CAP_MSMF,
     }[name]
+
+
+def primary_display_shape() -> tuple[int, int]:
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            user32.SetProcessDPIAware()
+            width = int(user32.GetSystemMetrics(0))
+            height = int(user32.GetSystemMetrics(1))
+            if width > 0 and height > 0:
+                return height, width
+        except Exception:
+            pass
+    return 720, 1280
+
+
+def output_shape_from_args(args: argparse.Namespace) -> tuple[int, int]:
+    if args.display_width > 0 and args.display_height > 0:
+        return args.display_height, args.display_width
+    if args.windowed:
+        return 720, 1280
+    return primary_display_shape()
 
 
 def start_input_thread(command_queue: queue.Queue[str]) -> threading.Thread:
@@ -777,6 +823,25 @@ def fit_frame_to_shape(frame: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     return cropped
 
 
+def fit_mask_to_shape(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    target_height, target_width = shape
+    source_height, source_width = mask.shape[:2]
+    if source_height <= 0 or source_width <= 0:
+        return np.zeros((target_height, target_width), dtype=np.float32)
+
+    scale = max(target_width / source_width, target_height / source_height)
+    resized_width = max(1, int(source_width * scale))
+    resized_height = max(1, int(source_height * scale))
+    resized = cv2.resize(mask, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+
+    x0 = max(0, (resized_width - target_width) // 2)
+    y0 = max(0, (resized_height - target_height) // 2)
+    cropped = resized[y0 : y0 + target_height, x0 : x0 + target_width]
+    if cropped.shape[:2] != (target_height, target_width):
+        cropped = cv2.resize(cropped, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+    return cropped.astype(np.float32)
+
+
 def blur_background(
     frame: np.ndarray,
     segmentation: mp.solutions.selfie_segmentation.SelfieSegmentation,
@@ -1071,6 +1136,279 @@ def draw_centered_text(
     cv2.putText(frame, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
 
 
+def cubic_bezier_points(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+    samples: int = 36,
+) -> np.ndarray:
+    t = np.linspace(0.0, 1.0, samples, dtype=np.float32)[:, None]
+    points = ((1 - t) ** 3 * p0) + (3 * (1 - t) ** 2 * t * p1) + (3 * (1 - t) * t**2 * p2) + (t**3 * p3)
+    return points.astype(np.int32).reshape((-1, 1, 2))
+
+
+def make_idle_base(shape: tuple[int, int]) -> np.ndarray:
+    height, width = shape
+    cached = IDLE_BASE_CACHE.get((height, width))
+    if cached is not None:
+        return cached.copy()
+
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    cx = width * 0.58
+    cy = height * 0.38
+    radius = np.sqrt(((xx - cx) / max(1.0, width)) ** 2 + ((yy - cy) / max(1.0, height)) ** 2)
+    glow = np.clip(1.0 - radius * 2.2, 0.0, 1.0)
+    base = np.zeros((height, width, 3), dtype=np.float32)
+    base[:] = (15, 10, 10)
+    purple = np.array((46, 10, 26), dtype=np.float32)
+    base = base * (1.0 - glow[..., None] * 0.82) + purple * (glow[..., None] * 0.82)
+
+    pattern = np.zeros((height, width, 3), dtype=np.uint8)
+    for index in range(22):
+        x = 40 + (index / 21.0) * width
+        amp = (18 + (index % 5) * 12) * width / 1280.0
+        y2 = height * (0.72 + (index % 3) * 0.13)
+        first = cubic_bezier_points(
+            (x, 0),
+            (x + amp, y2 * 0.18),
+            (x - amp, y2 * 0.38),
+            (x + amp * 0.6, y2 * 0.58),
+        )
+        second = cubic_bezier_points(
+            (x + amp * 0.6, y2 * 0.58),
+            (x - amp * 0.4, y2 * 0.78),
+            (x + amp * 0.2, y2 * 0.9),
+            (x, y2),
+        )
+        opacity = 0.035 + (index % 4) * 0.014
+        color = tuple(int(255 * opacity) for _ in range(3))
+        cv2.polylines(pattern, [first, second], False, color, max(1, int(width / 1280)), cv2.LINE_AA)
+
+    base = cv2.add(base.astype(np.uint8), pattern)
+    IDLE_BASE_CACHE[(height, width)] = base
+    return base.copy()
+
+
+def draw_animated_diamond(frame: np.ndarray) -> None:
+    height, width = frame.shape[:2]
+    scale = min(width / 1280.0, height / 720.0)
+    phase = time.monotonic() * (2.0 * np.pi / 2.2)
+    y_offset = int(np.sin(phase) * max(5, int(9 * scale)))
+    center = (width // 2, int(height * 0.047) + y_offset)
+    size = max(12, int(min(width, height) * 0.022))
+    color = (120, 98, 105)
+    thickness = max(2, int(3 * scale))
+
+    outer = np.array(
+        [
+            (center[0], center[1] - size),
+            (center[0] + size, center[1]),
+            (center[0], center[1] + size),
+            (center[0] - size, center[1]),
+        ],
+        dtype=np.int32,
+    )
+    inner_size = int(size * 0.48)
+    inner = np.array(
+        [
+            (center[0], center[1] - inner_size),
+            (center[0] + inner_size, center[1]),
+            (center[0], center[1] + inner_size),
+            (center[0] - inner_size, center[1]),
+        ],
+        dtype=np.int32,
+    )
+    cv2.polylines(frame, [outer], True, color, thickness, cv2.LINE_AA)
+    cv2.polylines(frame, [inner], True, color, thickness, cv2.LINE_AA)
+
+
+def bgr_to_rgb(color: tuple[int, int, int]) -> tuple[int, int, int]:
+    return color[2], color[1], color[0]
+
+
+def load_ui_font(file_name: str, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    key = (file_name, size)
+    cached = FONT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    font_path = FONT_DIR / file_name
+    if font_path.exists():
+        font = ImageFont.truetype(str(font_path), size)
+    else:
+        font = ImageFont.load_default()
+    FONT_CACHE[key] = font
+    return font
+
+
+def text_bbox_size(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> tuple[int, int]:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def spaced_text_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    spacing: int,
+) -> int:
+    if not text:
+        return 0
+    return sum(text_bbox_size(draw, char, font)[0] for char in text) + spacing * (len(text) - 1)
+
+
+def draw_spaced_text(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    fill: tuple[int, int, int],
+    spacing: int,
+) -> None:
+    x, y = xy
+    for char in text:
+        draw.text((x, y), char, font=font, fill=fill)
+        x += text_bbox_size(draw, char, font)[0] + spacing
+
+
+def draw_text_centered_at(
+    draw: ImageDraw.ImageDraw,
+    width: int,
+    text: str,
+    center_y: int,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    fill: tuple[int, int, int],
+    spacing: int,
+) -> None:
+    text_width = spaced_text_width(draw, text, font, spacing)
+    _, text_height = text_bbox_size(draw, text, font)
+    x = (width - text_width) // 2
+    y = center_y - text_height // 2
+    draw_spaced_text(draw, (x, y), text, font, fill, spacing)
+
+
+def draw_story_chips(
+    draw: ImageDraw.ImageDraw,
+    width: int,
+    height: int,
+    scale: float,
+) -> None:
+    font = load_ui_font("segoeuisl.ttf", max(13, int(18 * scale)))
+    gap = max(10, int(width * 0.012))
+    chip_height = max(34, int(42 * scale))
+    y1 = height - chip_height - max(8, int(height * 0.012))
+
+    chips = []
+    total_width = 0
+    for story_id, label, color in IDLE_STORY_CARDS:
+        text = f"Story {story_id} - {label}"
+        text_width, _ = text_bbox_size(draw, text, font)
+        chip_width = text_width + max(52, int(70 * scale))
+        chips.append((text, color, chip_width))
+        total_width += chip_width
+    total_width += gap * (len(chips) - 1)
+
+    x = max(8, (width - total_width) // 2)
+    text_fill = (174, 170, 178)
+    fill = (0, 0, 0, 112)
+    for text, color_bgr, chip_width in chips:
+        color = bgr_to_rgb(color_bgr)
+        border = tuple(max(75, int(channel * 0.72)) for channel in color)
+        x2 = x + chip_width
+        y2 = y1 + chip_height
+        radius = chip_height // 2
+        draw.rounded_rectangle((x, y1, x2, y2), radius=radius, fill=fill, outline=border + (205,), width=max(1, int(scale)))
+
+        dot_radius = max(4, int(5 * scale))
+        dot_center = (x + int(chip_height * 0.62), y1 + chip_height // 2)
+        draw.ellipse(
+            (
+                dot_center[0] - dot_radius,
+                dot_center[1] - dot_radius,
+                dot_center[0] + dot_radius,
+                dot_center[1] + dot_radius,
+            ),
+            fill=color,
+        )
+
+        _, text_height = text_bbox_size(draw, text, font)
+        text_x = x + int(chip_height * 1.02)
+        text_y = y1 + (chip_height - text_height) // 2 - int(2 * scale)
+        draw.text((text_x, text_y), text, font=font, fill=text_fill)
+        x = x2 + gap
+
+
+def make_idle_ui_overlay(shape: tuple[int, int]) -> np.ndarray:
+    height, width = shape
+    cached = IDLE_UI_OVERLAY_CACHE.get((height, width))
+    if cached is not None:
+        return cached.copy()
+
+    scale = min(width / 1280.0, height / 720.0)
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image, "RGBA")
+
+    prompt_font = load_ui_font("segoeuil.ttf", max(20, int(34 * scale)))
+    prompt_fill = (174, 166, 181, 255)
+    letter_spacing = max(1, int(3 * scale))
+    draw_text_centered_at(draw, width, IDLE_MESSAGE_LINES[0], int(height * 0.155), prompt_font, prompt_fill, letter_spacing)
+    draw_text_centered_at(draw, width, IDLE_MESSAGE_LINES[1], int(height * 0.215), prompt_font, prompt_fill, letter_spacing)
+    draw_story_chips(draw, width, height, scale)
+
+    overlay = np.array(image)
+    IDLE_UI_OVERLAY_CACHE[(height, width)] = overlay
+    return overlay.copy()
+
+
+def draw_idle_ui(frame: np.ndarray) -> np.ndarray:
+    height, width = frame.shape[:2]
+    overlay = make_idle_ui_overlay((height, width))
+    alpha = overlay[:, :, 3:4].astype(np.float32) / 255.0
+    overlay_bgr = cv2.cvtColor(overlay[:, :, :3], cv2.COLOR_RGB2BGR).astype(np.float32)
+    blended = overlay_bgr * alpha + frame.astype(np.float32) * (1.0 - alpha)
+    result = blended.astype(np.uint8)
+    draw_animated_diamond(result)
+    return result
+
+
+def render_idle_scene(
+    frame: np.ndarray | None,
+    segmentation: mp.solutions.selfie_segmentation.SelfieSegmentation | None,
+    shape: tuple[int, int] | None = None,
+) -> np.ndarray:
+    if shape is not None:
+        height, width = shape
+    elif frame is not None:
+        height, width = frame.shape[:2]
+    else:
+        height, width = (720, 1280)
+
+    idle = make_idle_base((height, width))
+    if frame is not None and segmentation is not None:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = segmentation.process(rgb)
+        mask = result.segmentation_mask
+        if mask is not None:
+            mask = cv2.GaussianBlur(mask, (31, 31), 0)
+            alpha = np.clip((mask - 0.24) / 0.58, 0.0, 0.86)
+            if frame.shape[:2] != (height, width):
+                alpha = fit_mask_to_shape(alpha, (height, width))
+                person = fit_frame_to_shape(frame, (height, width)).astype(np.float32)
+            else:
+                person = frame.astype(np.float32)
+            alpha_3 = np.dstack([alpha] * 3)
+            tint = np.full_like(person, (38, 28, 48), dtype=np.float32)
+            person = person * 0.72 + tint * 0.28
+            idle = (person * alpha_3 + idle.astype(np.float32) * (1.0 - alpha_3)).astype(np.uint8)
+
+    return draw_idle_ui(idle)
+
+
 def draw_birthday_effect(frame: np.ndarray) -> np.ndarray:
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]), (20, 10, 45), -1)
@@ -1081,26 +1419,19 @@ def draw_birthday_effect(frame: np.ndarray) -> np.ndarray:
 
 
 def draw_idle_message(frame: np.ndarray) -> np.ndarray:
-    draw_centered_text(frame, IDLE_MESSAGE_LINES[0], 0.43, (230, 230, 225), (0, 0, 0), max_width_ratio=0.88)
-    draw_centered_text(frame, IDLE_MESSAGE_LINES[1], 0.58, (230, 230, 225), (0, 0, 0), max_width_ratio=0.72)
-    return frame
+    return draw_idle_ui(frame)
 
 
 def make_idle_screen(shape: tuple[int, int]) -> np.ndarray:
-    height, width = shape
-    frame = np.zeros((height, width, 3), dtype=np.uint8)
-    frame[:] = (8, 8, 10)
-    return draw_idle_message(frame)
+    return render_idle_scene(None, None, shape)
 
 
 def process_idle_frame(
     frame: np.ndarray,
     segmentation: mp.solutions.selfie_segmentation.SelfieSegmentation,
+    output_shape: tuple[int, int] | None = None,
 ) -> np.ndarray:
-    idle = blur_background(frame, segmentation)
-    shade = np.zeros_like(idle)
-    cv2.addWeighted(shade, 0.34, idle, 0.66, 0, idle)
-    return draw_idle_message(idle)
+    return render_idle_scene(frame, segmentation, output_shape)
 
 
 def process_active_frame(
@@ -1224,7 +1555,9 @@ def main() -> int:
         return run_long_calibration(args)
 
     fallback_shape = (720, 1280)
-    startup_frame = make_idle_screen(fallback_shape)
+    output_shape = output_shape_from_args(args)
+    print(f"Output canvas: {output_shape[1]}x{output_shape[0]}")
+    startup_frame = make_idle_screen(output_shape)
 
     configure_window(args.windowed)
     show_frame(startup_frame)
@@ -1355,7 +1688,7 @@ def main() -> int:
                                     active_effect = None
                                     active_from_nfc = False
                                     debug_face_detected_at = None
-                                    display_frame = process_idle_frame(frame, segmentation)
+                                    display_frame = process_idle_frame(frame, segmentation, output_shape)
                                     key = show_frame(display_frame)
                                     if key == 27:
                                         break
@@ -1370,7 +1703,7 @@ def main() -> int:
                                 active_video = None
                                 active_effect = None
                                 debug_face_detected_at = None
-                                display_frame = process_idle_frame(frame, segmentation)
+                                display_frame = process_idle_frame(frame, segmentation, output_shape)
                                 key = show_frame(display_frame)
                                 if key == 27:
                                     break
@@ -1409,8 +1742,10 @@ def main() -> int:
                 active_effect = None
                 active_from_nfc = False
                 debug_face_detected_at = None
-                display_frame = process_idle_frame(frame, segmentation)
+                display_frame = process_idle_frame(frame, segmentation, output_shape)
 
+            if display_frame.shape[:2] != output_shape:
+                display_frame = fit_frame_to_shape(display_frame, output_shape)
             key = show_frame(display_frame)
             if key == 27:
                 break
