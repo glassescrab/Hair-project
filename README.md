@@ -41,17 +41,31 @@ Check that the environment is ready:
 ffplay -version
 ```
 
-If `ffplay` is installed but not on `PATH`, pass the full path when starting the
-app:
+If `ffplay -version` is not found after installing FFmpeg, use the full
+`ffplay.exe` path when starting the app. The default `winget` install path is
+usually:
+
+```text
+C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffplay.exe
+```
+
+Use this command if `ffplay` is not on `PATH`:
 
 ```powershell
-.\.venv\Scripts\python.exe hair_exhibition.py --audio-player C:\path\to\ffplay.exe
+.\.venv\Scripts\python.exe hair_exhibition.py --audio-player "C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffplay.exe"
 ```
 
 ## Run
 
 ```powershell
 .\.venv\Scripts\python.exe hair_exhibition.py
+```
+
+If MP4 audio does not play with the normal run command, run with the full
+`ffplay.exe` path:
+
+```powershell
+.\.venv\Scripts\python.exe hair_exhibition.py --audio-player "C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffplay.exe"
 ```
 
 Terminal controls:
