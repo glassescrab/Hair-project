@@ -131,6 +131,11 @@ Video assets:
 - Current video mapping is `1 = story1.mp4`, `2 = story2.mp4`, and `3 = story3.mp4`.
 - MP4 audio is played through `ffplay`, so FFmpeg must be installed and
   `ffplay` must be on `PATH`, or pass its full path with `--audio-player`.
+- While a story video is playing, the camera/person hair effect is shown only
+  during the first 10 seconds and the last 10 seconds of the video. The middle
+  of the video plays unobstructed. Videos shorter than 20 seconds keep the
+  camera/person hair effect visible for the full video because the two windows
+  overlap.
 - NFC hair modes stay active until the card is removed. When the video reaches
   the end while the card is still present, it loops without an NFC retrigger. If
   a video is missing or cannot be opened, NFC mode keeps the hair effect active

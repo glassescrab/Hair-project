@@ -30,6 +30,7 @@ LAYERED_GENERATED_DIR = ASSET_DIR / "layered_generated"
 LAYERED_DOWNLOADED_DIR = ASSET_DIR / "layered_downloaded"
 BIRTHDAY_COMMAND = "xd"
 BIRTHDAY_MESSAGE = "happy birthday, xd"
+VIDEO_CAMERA_OVERLAY_SECONDS = 10.0
 IDLE_MESSAGE_LINES = (
     "PICK UP A STORY.",
     "PLACE IT ON THE STAND.",
@@ -92,6 +93,25 @@ class VideoPlayback:
 
     def is_opened(self) -> bool:
         return self.capture.isOpened()
+
+    def elapsed_seconds(self) -> float:
+        if self.started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self.started_at)
+
+    def duration_seconds(self) -> float | None:
+        if self.fps <= 0 or self.frame_count <= 0:
+            return None
+        return self.frame_count / self.fps
+
+    def should_show_camera_overlay(self, window_seconds: float = VIDEO_CAMERA_OVERLAY_SECONDS) -> bool:
+        elapsed = self.elapsed_seconds()
+        duration = self.duration_seconds()
+        if duration is None:
+            return elapsed <= window_seconds
+        if duration <= window_seconds * 2:
+            return True
+        return elapsed <= window_seconds or elapsed >= duration - window_seconds
 
     def read(self, shape: tuple[int, int]) -> np.ndarray | None:
         if self.started_at is None:
@@ -1675,6 +1695,7 @@ def main() -> int:
             if has_video_mode or has_timed_mode:
                 if isinstance(active_effect, HairMode):
                     background_frame = None
+                    show_camera_overlay = True
                     if active_video is not None:
                         background_frame = active_video.read(frame.shape[:2])
                         if background_frame is None:
@@ -1712,14 +1733,28 @@ def main() -> int:
                                 elif key == ord("x"):
                                     command_queue.put("xd")
                                 continue
-                    display_frame, found_face = process_active_frame(
-                        frame,
-                        active_effect,
-                        hair_assets,
-                        face_mesh,
-                        segmentation,
-                        background_frame,
-                    )
+                        show_camera_overlay = active_video.should_show_camera_overlay()
+                    if show_camera_overlay:
+                        display_frame, found_face = process_active_frame(
+                            frame,
+                            active_effect,
+                            hair_assets,
+                            face_mesh,
+                            segmentation,
+                            background_frame,
+                        )
+                    elif background_frame is not None:
+                        display_frame = background_frame
+                        found_face = False
+                    else:
+                        display_frame, found_face = process_active_frame(
+                            frame,
+                            active_effect,
+                            hair_assets,
+                            face_mesh,
+                            segmentation,
+                            background_frame,
+                        )
                     if args.debug_save and found_face and debug_face_detected_at is None:
                         debug_face_detected_at = now
                     if (
