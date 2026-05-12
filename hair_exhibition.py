@@ -30,7 +30,8 @@ LAYERED_GENERATED_DIR = ASSET_DIR / "layered_generated"
 LAYERED_DOWNLOADED_DIR = ASSET_DIR / "layered_downloaded"
 BIRTHDAY_COMMAND = "xd"
 BIRTHDAY_MESSAGE = "happy birthday, xd"
-VIDEO_CAMERA_OVERLAY_SECONDS = 10.0
+VIDEO_CAMERA_OVERLAY_START_SECONDS = 10.0
+VIDEO_CAMERA_OVERLAY_END_SECONDS = 15.0
 IDLE_MESSAGE_LINES = (
     "PICK UP A STORY.",
     "PLACE IT ON THE STAND.",
@@ -104,14 +105,18 @@ class VideoPlayback:
             return None
         return self.frame_count / self.fps
 
-    def should_show_camera_overlay(self, window_seconds: float = VIDEO_CAMERA_OVERLAY_SECONDS) -> bool:
+    def should_show_camera_overlay(
+        self,
+        start_seconds: float = VIDEO_CAMERA_OVERLAY_START_SECONDS,
+        end_seconds: float = VIDEO_CAMERA_OVERLAY_END_SECONDS,
+    ) -> bool:
         elapsed = self.elapsed_seconds()
         duration = self.duration_seconds()
         if duration is None:
-            return elapsed <= window_seconds
-        if duration <= window_seconds * 2:
+            return elapsed <= start_seconds
+        if duration <= start_seconds + end_seconds:
             return True
-        return elapsed <= window_seconds or elapsed >= duration - window_seconds
+        return elapsed <= start_seconds or elapsed >= duration - end_seconds
 
     def read(self, shape: tuple[int, int]) -> np.ndarray | None:
         if self.started_at is None:
